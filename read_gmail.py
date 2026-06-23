@@ -1,54 +1,91 @@
+import os
 import time
-import re
 import dateparser
-from datetime import datetime, timedelta
-# יש להוסיף כאן את הייבואים של ה-API שכבר עובדים לך (googleapiclient וכו')
+import re
+from datetime import datetime, timezone, timedelta
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
 
-def parse_meeting_time(text):
-    """מנסה למצוא תאריך ושעה בטקסט חופשי"""
-    # חיפוש תבניות כמו 24/06/2026 או 24.06.26
-    date_match = re.search(r'(\d{1,2}[./]\d{1,2}[./]\d{2,4})', text)
-    # חיפוש טווח שעות כמו 08:00-10:00
+# הרשאות גישה (גם למייל וגם ליומן)
+SCOPES = [
+    'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/calendar'
+]
+
+def get_service(api_name, version):
+    creds = None
+    token_file = f'token_{api_name}.json'
+    if os.path.exists(token_file):
+        creds = Credentials.from_authorized_user_file(token_file, SCOPES)
+    if not creds or not creds.valid:
+        flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+        creds = flow.run_local_server(port=0)
+        with open(token_file, 'w') as token:
+            token.write(creds.to_json())
+    return build(api_name, version, credentials=creds)
+
+def parse_date_from_text(text):
+    """חילוץ תאריך ושעה מתוך הטקסט בצורה גמישה"""
+    # חיפוש תבנית של שעות (למשל 08:00-10:00)
     time_match = re.search(r'(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})', text)
+    if not time_match: return None, None
     
-    if date_match and time_match:
-        date_str = date_match.group(1)
-        start_time_str = time_match.group(1)
-        end_time_str = time_match.group(2)
-        
-        # המרה לאובייקט datetime
-        start_dt = dateparser.parse(f"{date_str} {start_time_str}")
-        end_dt = dateparser.parse(f"{date_str} {end_time_str}")
-        return start_dt, end_dt
-    return None, None
+    start_time = time_match.group(1)
+    end_time = time_match.group(2)
+    
+    # שימוש ב-dateparser למציאת תאריך בטקסט (למשל "24/06/2026")
+    parsed_date = dateparser.parse(text, languages=['he', 'en'])
+    if not parsed_date: return None, None
+    
+    start_dt = parsed_date.replace(hour=int(start_time.split(':')[0]), minute=int(start_time.split(':')[1]), second=0, tzinfo=timezone.utc)
+    end_dt = parsed_date.replace(hour=int(end_time.split(':')[0]), minute=int(end_time.split(':')[1]), second=0, tzinfo=timezone.utc)
+    
+    return start_dt, end_dt
 
-def check_calendar_conflict(service, start, end):
-    """בודק אם יש פגישה בטווח הזמן הזה"""
-    events_result = service.events().list(
-        calendarId='primary', 
-        timeMin=start.isoformat() + 'Z',
-        timeMax=end.isoformat() + 'Z',
+def check_conflict(cal_service, start, end):
+    events = cal_service.events().list(
+        calendarId='primary',
+        timeMin=start.isoformat(),
+        timeMax=end.isoformat(),
         singleEvents=True
     ).execute()
-    return len(events_result.get('items', [])) > 0
+    return len(events.get('items', [])) > 0
 
-def run_automation():
+def process_emails():
     print(f"--- הרצה: {datetime.now()} ---")
-    # 1. קריאת מיילים (הלוגיקה שלך)
-    # 2. ניתוח טקסט בעזרת parse_meeting_time
-    # 3. אם מצאנו:
-    #    if check_calendar_conflict(...):
-    #        send_email("התנגשות בלו"ז! לא ניתן לקבוע את הפגישה.")
-    #    else:
-    #        create_calendar_event(...)
-    pass
+    gmail = get_service('gmail', 'v1')
+    calendar = get_service('calendar', 'v3')
+    
+    # חיפוש מיילים שלא נקראו
+    results = gmail.users().messages().list(userId='me', q='is:unread').execute()
+    messages = results.get('messages', [])
+    
+    for msg in messages:
+        full_msg = gmail.users().messages().get(userId='me', id=msg['id']).execute()
+        snippet = full_msg['snippet']
+        subject = next(h['value'] for h in full_msg['payload']['headers'] if h['name'] == 'Subject')
+        
+        print(f"בודק מייל: {subject}")
+        
+        start, end = parse_date_from_text(f"{subject} {snippet}")
+        
+        if start and end:
+            if check_conflict(calendar, start, end):
+                print("⚠️ נמצאה התנגשות בלו"ז! שולח מייל התראה...")
+                # כאן אפשר להוסיף קוד לשליחת מייל חזרה
+            else:
+                print(f"✅ קובע פגישה: {subject}")
+                event = {'summary': subject, 'start': {'dateTime': start.isoformat()}, 'end': {'dateTime': end.isoformat()}}
+                calendar.events().insert(calendarId='primary', body=event).execute()
+                # מסמן כמקרא (כדי לא לטפל שוב)
+                gmail.users().messages().modify(userId='me', id=msg['id'], body={'removeLabelIds': ['UNREAD']}).execute()
 
-# לולאה שרצה כל 30 דקות
 while True:
     try:
-        run_automation()
+        process_emails()
     except Exception as e:
-        print(f"שגיאה: {e}")
-    
-    print("מחכה 30 דקות להרצה הבאה...")
-    time.sleep(1800) # 1800 שניות = 30 דקות
+        print(f"שגיאה בהרצה: {e}")
+    print("מחכה 30 דקות...")
+    time.sleep(1800)
